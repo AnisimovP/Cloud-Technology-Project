@@ -1,7 +1,7 @@
 import os
 
-from lib.kafka_connect import KafkaConsumer, KafkaProducer
-from lib.pg import PgConnect
+from lib.kafka_connect.kafka_connectors import KafkaConsumer, KafkaProducer
+from lib.pg.pg_connect import PgConnect
 
 
 class AppConfig:
