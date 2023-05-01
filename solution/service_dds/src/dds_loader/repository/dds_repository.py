@@ -12,18 +12,9 @@ class DdsRepository:
         self._db = db
 
     def get_user_category_counters(self, user_pk: str, dict_category_pk: dict) -> list:
-        """
-        агрегирует заказы посетителя по категориям товаров
-        для заданного id пользователя и списка id категорий (все id - строки).
-        на выходе - list od dicts; ключи в каждом словаре:
-        "h_user_pk", "h_category_pk", "category_name", "order_cnt".
-        Если ничего не найдено - на выходе пустой список.
-        """
 
         counters = []
 
-        # dict там на входе - как вариант дедупликации;
-        # берём keys(), маппим uuid-ы в строки, джойним
         category_pk_stringified = list(map(lambda x: str(x), dict_category_pk.keys()))
         str_category_pk = "'" + ("', '".join(category_pk_stringified)) + "'"
 
