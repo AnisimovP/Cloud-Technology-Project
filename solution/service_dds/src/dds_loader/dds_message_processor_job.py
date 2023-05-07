@@ -1,176 +1,104 @@
 from datetime import datetime
 from logging import Logger
+from typing import Dict, List
 
-from lib.kafka_connect.kafka_connectors import KafkaConsumer, KafkaProducer
-from dds_loader.repository.dds_repository import DdsRepository
+from lib.kafka_connect import KafkaConsumer, KafkaProducer
+from dds_loader.repository.dds_repository import DdsRepository, OrderDdsBuilder
 
-import uuid
 
 class DdsMessageProcessor:
     def __init__(self,
-                 kafka_consumer: KafkaConsumer,
-                 kafka_producer: KafkaProducer,
-                 dds_repository: DdsRepository,
+                 consumer: KafkaConsumer,
+                 producer: KafkaProducer,
+                 dds: DdsRepository,
                  logger: Logger) -> None:
+        self._consumer = consumer
+        self._producer = producer
+        self._repository = dds
 
-        self._kafka_consumer = kafka_consumer
-        self._kafka_producer = kafka_producer
-        self._dds_repository = dds_repository
         self._logger = logger
         self._batch_size = 30
 
     def run(self) -> None:
         self._logger.info(f"{datetime.utcnow()}: START")
 
-        processed_messages = 0;
-        timeout: float = 3.0
-        while processed_messages < self._batch_size:
-                
-            dct_msg = self._kafka_consumer.consume(timeout=timeout)
+        for _ in range(self._batch_size):
+            msg = self._consumer.consume()
+            if not msg:
+                self._logger.info(f"{datetime.utcnow()}: NO messages. Quitting.")
+                break
 
+            self._logger.info(f"{datetime.utcnow()}: {msg}")
 
-            if 'object_type' not in dct_msg:
-                self._logger.info(f"no object type in: {dct_msg}")
-                continue
+            order_dict = msg['payload']
+            builder = OrderDdsBuilder(order_dict)
 
-            if dct_msg['object_type'] != 'order':
-                continue
+            self._load_hubs(builder)
+            self._load_links(builder)
+            self._load_sats(builder)
 
+            dst_msg = {
+                "object_id": str(builder.h_order().h_order_pk),
+                "sent_dttm": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                "object_type": "order_report",
+                "payload": {
+                    "id": str(builder.h_order().h_order_pk),
+                    "order_dt": builder.h_order().order_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    "status": builder.s_order_status().status,
+                    "restaurant": {
+                        "id": str(builder.h_restaurant().h_restaurant_pk),
+                        "name": builder.s_restaurant_names().restaurant_name
+                    },
+                    "user": {
+                        "id": str(builder.h_user().h_user_pk),
+                        "username": builder.s_user_names().username
+                    },
+                    "products": self._format_products(builder)
+                }
+            }
 
-            load_dt = datetime.utcnow()
-            load_src = 'orders_backend'
+            self._logger.info(f"{datetime.utcnow()}: {dst_msg}")
+            self._producer.produce(dst_msg)
 
+        self._logger.info(f"{datetime.utcnow()}: FINISH")
 
-            order_id = dct_msg['payload']['id']
-            h_order_pk = uuid.uuid3(uuid.NAMESPACE_X500, str(order_id))
-            order_dt = dct_msg['payload']['date']
-            order_cost = dct_msg['payload']['cost']
-            order_payment = dct_msg['payload']['payment']
-            order_status = dct_msg['payload']['status']
-            self._dds_repository.order_upsert(
-                h_order_pk, 
-                order_id, 
-                order_dt,
-                order_cost, 
-                order_payment, 
-                order_status,
-                load_dt, 
-                load_src
-            )
+    def _load_hubs(self, builder: OrderDdsBuilder) -> None:
+        self._repository.h_user_insert(builder.h_user())
+        for p in builder.h_product():
+            self._repository.h_product_insert(p)
+        for c in builder.h_category():
+            self._repository.h_category_insert(c)
+        self._repository.h_restaurant_insert(builder.h_restaurant())
+        self._repository.h_order_insert(builder.h_order())
 
-            user_id = dct_msg['payload']['user']['id']
-            h_user_pk = uuid.uuid3(uuid.NAMESPACE_X500, user_id)
-            username = dct_msg['payload']['user']['name']
-            userlogin = username
-            if 'login' in dct_msg['payload']['user']:
-                userlogin = dct_msg['payload']['user']['login']
-            self._dds_repository.user_upsert(
-                h_user_pk, 
-                user_id, 
-                username, 
-                userlogin,
-                load_dt, 
-                load_src
-            )
+    def _load_links(self, builder: OrderDdsBuilder) -> None:
+        self._repository.l_order_user_insert(builder.l_order_user())
+        for op_link in builder.l_order_product():
+            self._repository.l_order_product_insert(op_link)
+        for pr_link in builder.l_product_restaurant():
+            self._repository.l_product_restaurant_insert(pr_link)
+        for pc_link in builder.l_product_category():
+            self._repository.l_product_category_insert(pc_link)
 
-            restaurant_id = dct_msg['payload']['restaurant']['id']
-            h_restaurant_pk = uuid.uuid3(uuid.NAMESPACE_X500, restaurant_id)
-            restaurant_name = dct_msg['payload']['restaurant']['name']
-            self._dds_repository.restaurant_upsert(
-                h_restaurant_pk, 
-                restaurant_id, 
-                restaurant_name,
-                load_dt, 
-                load_src
-            )
+    def _load_sats(self, builder: OrderDdsBuilder) -> None:
+        self._repository.s_order_cost_insert(builder.s_order_cost())
+        self._repository.s_order_status_insert(builder.s_order_status())
+        self._repository.s_restaurant_names_insert(builder.s_restaurant_names())
+        self._repository.s_user_names_insert(builder.s_user_names())
+        for pn in builder.s_product_names():
+            self._repository.s_product_names_insert(pn)
 
+    def _format_products(self, builder: OrderDdsBuilder) -> List[Dict]:
+        products = []
+        p_names = {x.h_product_pk: x.name for x in builder.s_product_names()}
+        cat_names = {x.h_category_pk: {"id": str(x.h_category_pk), "name": x.category_name} for x in builder.h_category()}
+        prod_cats = {x.h_product_pk: cat_names[x.h_category_pk] for x in builder.l_product_category()}
 
-            dct_products = {}
-            dct_categories = {}
-            for product in dct_msg['payload']['products']:
-                category = product['category']
-                dct_categories[category] = category
-                product_id = product['_id']
-                product_name = product['name']
-                dct_products[product_id] = product_name
-            
-
-            for next_category in dct_categories:
-                h_category_pk = uuid.uuid3(uuid.NAMESPACE_X500, next_category)
-                self._dds_repository.category_upsert(
-                    h_category_pk, 
-                    next_category, 
-                    load_dt, 
-                    load_src)
-
-
-            hk_order_user_pk = uuid.uuid3(
-                uuid.NAMESPACE_X500,
-                str(h_order_pk) + '/' + str(h_user_pk)
-            )
-            self._dds_repository.l_order_user_upsert(
-                hk_order_user_pk,
-                h_order_pk, h_user_pk,
-                load_dt, load_src
-            )
-
-
-            for product in dct_msg['payload']['products']:
-
-                next_product_id = product['_id']
-                next_product_name = product['name']
-                h_product_pk = uuid.uuid3(uuid.NAMESPACE_X500, next_product_id)
-                self._dds_repository.product_upsert(
-                    h_product_pk, 
-                    next_product_id, 
-                    next_product_name,
-                    load_dt, 
-                    load_src
-                )
-
-
-                next_product_category = product['category']
-                next_h_category_pk = uuid.uuid3(uuid.NAMESPACE_X500, next_product_category)
-                hk_product_category_pk = uuid.uuid3(
-                    uuid.NAMESPACE_X500,
-                    str(h_product_pk) + '/' + str(next_h_category_pk)
-                )
-                
-                self._dds_repository.l_product_category_upsert(
-                    hk_product_category_pk,
-                    h_product_pk, 
-                    next_h_category_pk,
-                    load_dt, 
-                    load_src
-                )
-                
-                hk_product_restaurant_pk = uuid.uuid3(
-                    uuid.NAMESPACE_X500,
-                    str(h_product_pk) + '/' + str(h_restaurant_pk)
-                )
-                self._dds_repository.l_product_restaurant_upsert(
-                    hk_product_restaurant_pk,
-                    h_product_pk, 
-                    h_restaurant_pk,
-                    load_dt, 
-                    load_src
-                )
-
-                hk_order_product_pk = uuid.uuid3(
-                    uuid.NAMESPACE_X500,
-                    str(h_order_pk) + '/' + str(h_product_pk)
-                )
-                self._dds_repository.l_order_product_upsert(
-                    hk_order_product_pk,
-                    h_order_pk, 
-                    h_product_pk,
-                    load_dt, 
-                    load_src
-                )
-
-            msg = 'message sent: {id}'.format(id=dct_msg['payload']['id'])
-            self._kafka_producer.produce(msg)
-            
-            processed_messages += 1
-
-            self._logger.info(f"{datetime.utcnow()}: FINISH")
+        for p in builder.h_product():
+            msg_prod = {
+                "id": str(p.h_product_pk),
+                "name": p_names[p.h_product_pk],
+                "category": prod_cats[p.h_product_pk]
+            }
+            products.append(msg_prod)
+        return products
